@@ -11,7 +11,7 @@
 
 
 module S3.Types exposing
-    ( Error(..), Account
+    ( Error(..), Account, Provider(..)
     , Bucket, Key, Mimetype
     , StorageClass, Owner, KeyInfo, KeyList
     , Query, QueryElement(..), CannedAcl(..)
@@ -23,7 +23,7 @@ module S3.Types exposing
 
 # Types
 
-@docs Error, Account
+@docs Error, Account, Provider
 @docs Bucket, Key, Mimetype
 @docs StorageClass, Owner, KeyInfo, KeyList
 @docs Query, QueryElement, CannedAcl
@@ -61,11 +61,19 @@ type Error
 type alias Account =
     { name : String
     , region : Maybe String
-    , isDigitalOcean : Bool
+    , provider : Provider
     , accessKey : String
     , secretKey : String
     , buckets : List String
     }
+
+
+{-| A specific S3-compatible provider (AWS, DigitalOcean), or a custom one
+-}
+type Provider
+    = AWS
+    | DigitalOcean
+    | Custom { host : String }
 
 
 {-| The StorageClass for a key returned from listing a bucket's contents.

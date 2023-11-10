@@ -17,10 +17,11 @@ module S3 exposing
     , getObject, getFullObject, getHeaders, getObjectWithHeaders
     , putHtmlObject, putPublicObject, putObject
     , deleteObject
-    , htmlBody, jsonBody, stringBody
+    , htmlBody, jsonBody, stringBody, fileBody
     , addQuery, addHeaders
     , readAccounts, decodeAccounts, accountDecoder, encodeAccount
     , objectPath, parserRequest, stringRequest, requestUrl
+    , makeService, presign
     )
 
 {-| Pure Elm client for the [AWS Simple Storage Service](https://aws.amazon.com/s3/) (S3) or [Digital Ocean Spaces](https://developers.digitalocean.com/documentation/spaces/).
@@ -28,7 +29,7 @@ module S3 exposing
 
 # Types
 
-@docs Request
+@docs Request, Provider
 
 
 # Turning a Request into a Task
@@ -46,7 +47,7 @@ module S3 exposing
 
 # Creating Body values
 
-@docs htmlBody, jsonBody, stringBody
+@docs htmlBody, jsonBody, stringBody, fileBody
 
 
 # Adding queries and headers to a request
@@ -80,8 +81,10 @@ import AWS.Http
         , emptyBody
         , request
         )
+import AWS.PreSign
 import AWS.Service as Service exposing (Service)
 import Dict exposing (Dict)
+import File
 import Http exposing (Metadata)
 import Json.Decode as JD exposing (Decoder)
 import Json.Encode as JE
@@ -98,12 +101,14 @@ import S3.Types
         , Key
         , KeyList
         , Mimetype
+        , Provider(..)
         , Query
         , QueryElement(..)
         , StorageClass
         , aclToString
         )
 import Task exposing (Task)
+import Time
 
 
 defaultAccountsUrl : String
@@ -217,16 +222,47 @@ encodeAccount account =
 
                 Just region ->
                     [ ( "region", JE.string region ) ]
-            , if account.isDigitalOcean then
-                [ ( "is-digital-ocean", JE.bool True ) ]
-
-              else
-                []
+            , [ ( "provider", encodeProvider account.provider ) ]
             , [ ( "access-key", JE.string account.accessKey )
               , ( "secret-key", JE.string account.secretKey )
               , ( "buckets", JE.list JE.string account.buckets )
               ]
             ]
+
+
+encodeProvider : Provider -> JE.Value
+encodeProvider provider =
+    case provider of
+        AWS ->
+            JE.string "aws"
+
+        DigitalOcean ->
+            JE.string "digital-ocean"
+
+        Custom { host } ->
+            JE.object [ ( "custom-host", JE.string host ) ]
+
+
+providerDecoder : Decoder Provider
+providerDecoder =
+    JD.oneOf
+        [ staticString "aws" AWS
+        , staticString "digital-ocean" DigitalOcean
+        , JD.field "custom-host" JD.string |> JD.map (\host -> Custom { host = host })
+        ]
+
+
+staticString : String -> a -> Decoder a
+staticString s a =
+    JD.string
+        |> JD.andThen
+            (\v ->
+                if v == s then
+                    JD.succeed a
+
+                else
+                    JD.fail ("not " ++ s)
+            )
 
 
 {-| A `Decoder` for the `Account` type.
@@ -240,11 +276,7 @@ accountDecoder =
             , JD.succeed Nothing
             ]
         )
-        (JD.oneOf
-            [ JD.field "is-digital-ocean" JD.bool
-            , JD.succeed False
-            ]
-        )
+        providerDecoder
         (JD.field "access-key" JD.string)
         (JD.field "secret-key" JD.string)
         (JD.field "buckets" (JD.list JD.string))
@@ -287,12 +319,19 @@ protocol =
 Sometimes useful for the `hostResolver`.
 
 -}
-makeService : Account -> Service
-makeService { region, isDigitalOcean } =
+makeService : Bucket -> Account -> Service
+makeService bucket { region, provider } =
     let
         prefix =
-            -- Changed by `send` to the bucket for Digital Ocean.
-            awsEndpointPrefix
+            case provider of
+                AWS ->
+                    awsEndpointPrefix
+
+                DigitalOcean ->
+                    ""
+
+                Custom { host } ->
+                    "refinable-lamdera.f14d9313dca69cfce6b84c73417cfe13.eu"
 
         service =
             case region of
@@ -313,12 +352,16 @@ makeService { region, isDigitalOcean } =
                             Config.SignV4
                             reg
     in
-    if isDigitalOcean then
-        -- regionResolver's default works for Digigal Ocean.
-        { service | hostResolver = digitalOceanHostResolver }
+    case provider of
+        AWS ->
+            service
 
-    else
-        service
+        DigitalOcean ->
+            -- regionResolver's default works for Digital Ocean.
+            { service | hostResolver = digitalOceanHostResolver }
+
+        Custom c ->
+            { service | hostResolver = customResolver c.host }
 
 
 digitalOceanHostResolver : Endpoint -> String -> String
@@ -331,6 +374,29 @@ digitalOceanHostResolver endpoint prefix =
             prefix ++ "." ++ rgn ++ ".digitaloceanspaces.com"
 
 
+customResolver : String -> Endpoint -> String -> String
+customResolver host endpoint prefix =
+    let
+        x =
+            Debug.log "provided prefix was" prefix
+
+        prefixAdjusted =
+            if prefix == "" then
+                ""
+
+            else
+                prefix ++ "."
+    in
+    -- @TODO do we need to support the prefix?
+    -- Cloudflare has EU and non-EU... is that warranted?
+    case endpoint of
+        GlobalEndpoint ->
+            prefixAdjusted ++ host
+
+        RegionalEndpoint rgn ->
+            prefixAdjusted ++ rgn ++ "." ++ host
+
+
 {-| A request that can be turned into a Task by `S3.send`.
 
 `a` is the type of the successful `Task` result from `S3.send`.
@@ -340,38 +406,55 @@ type alias Request a =
     AWS.Http.Request AWSAppError a
 
 
-fudgeRequest : Account -> Request a -> ( Service, Request a )
-fudgeRequest account request =
+fudgeRequest : Account -> Bucket -> Request a -> ( Service, Request a )
+fudgeRequest account bucket request =
+    -- This is bullshit and needs to go
     let
         service =
-            makeService account
-    in
-    if not account.isDigitalOcean then
-        ( service, request )
+            makeService bucket account
 
-    else
-        let
-            ( bucket, key ) =
-                pathBucketAndKey request.path
-        in
-        ( { service | endpointPrefix = bucket }
-        , { request | path = "/" ++ key }
-        )
+        _ =
+            Debug.log "fudging" request
+    in
+    Debug.log "fudged" <|
+        case account.provider of
+            AWS ->
+                ( service, request )
+
+            DigitalOcean ->
+                let
+                    ( _, key ) =
+                        pathBucketAndKey request.path
+                in
+                ( { service | endpointPrefix = bucket }
+                , { request | path = "/" ++ key }
+                )
+
+            Custom { host } ->
+                -- ( service, request )
+                let
+                    ( _, key ) =
+                        pathBucketAndKey request.path
+                in
+                ( { service | endpointPrefix = bucket ++ ".f14d9313dca69cfce6b84c73417cfe13" }
+                , { request | path = "/" ++ key }
+                  -- request
+                )
 
 
 {-| Create a `Task` to send a signed request over the wire.
 -}
-send : Account -> Request a -> Task Error a
-send account request =
+send : Bucket -> Account -> Request a -> Task Error a
+send bucket account request =
     let
-        ( service, req ) =
-            fudgeRequest account request
+        service =
+            makeService bucket account
 
         credentials =
             makeCredentials account
 
         req2 =
-            addHeaders [ AnyQuery "Accept" "*/*" ] req
+            addHeaders [ AnyQuery "Accept" "*/*" ] request
     in
     AWS.Http.send service credentials req2
         |> Task.onError
@@ -385,6 +468,20 @@ send account request =
                 )
                     |> Task.fail
             )
+
+
+presign : Bucket -> Account -> Time.Posix -> Request a -> String
+presign bucket account timestamp request =
+    let
+        service =
+            makeService bucket account
+
+        credentials =
+            makeCredentials account
+    in
+    request
+        |> (fudgeRequest account bucket >> Tuple.second)
+        |> AWS.PreSign.toUrl service credentials timestamp
 
 
 formatQuery : Query -> List ( String, String )
@@ -515,18 +612,20 @@ pathBucketAndKey path =
 The contents will be the successful result of the `Task` created by `S3.send`.
 
 -}
-getObject : Bucket -> Key -> Request String
-getObject bucket key =
+getObject : Account -> Bucket -> Key -> Request String
+getObject account bucket key =
     stringRequest "getObject" GET (objectPath bucket key) emptyBody
+        |> fudgeRequest account bucket
+        |> Tuple.second
 
 
 {-| Return the URL string for a request.
 -}
-requestUrl : Account -> Request a -> String
-requestUrl account req =
+requestUrl : Bucket -> Account -> Request a -> String
+requestUrl bucket account req =
     let
         ( service, request ) =
-            fudgeRequest account req
+            fudgeRequest account bucket req
 
         { hostResolver, endpoint, endpointPrefix } =
             service
@@ -608,17 +707,26 @@ stringBody =
     AWS.Http.stringBody
 
 
+{-| Create a body with any mimetype for `putObject` and friends.
+
+    stringBody "text/html" "Hello, World!"
+
+-}
+fileBody : File.File -> Body
+fileBody =
+    AWS.Http.fileBody
+
+
 {-| Write an object to S3, with default permissions (private).
 
 The string resulting from a successful `send` isn't interesting.
 
 -}
-putObject : Bucket -> Key -> Body -> Request String
-putObject bucket key body =
-    stringRequest "putObject"
-        PUT
-        (objectPath bucket key)
-        body
+putObject : Account -> Bucket -> Key -> Body -> Request String
+putObject account bucket key body =
+    stringRequest "putObject" PUT (objectPath bucket key) body
+        |> fudgeRequest account bucket
+        |> Tuple.second
 
 
 {-| Write an object to S3, with public-read permission.
@@ -626,9 +734,11 @@ putObject bucket key body =
 The string resulting from a successful `send` isn't interesting.
 
 -}
-putPublicObject : Bucket -> Key -> Body -> Request String
-putPublicObject bucket key body =
-    putObject bucket key body
+putPublicObject : Account -> Bucket -> Key -> Body -> Request String
+putPublicObject account bucket key body =
+    putObject account bucket key body
+        |> fudgeRequest account bucket
+        |> Tuple.second
         |> addHeaders [ XAmzAcl AclPublicRead ]
 
 
@@ -637,9 +747,9 @@ putPublicObject bucket key body =
 The string resulting from a successful `send` isn't interesting.
 
 -}
-putHtmlObject : Bucket -> Key -> String -> Request String
-putHtmlObject bucket key html =
-    putPublicObject bucket key <| htmlBody html
+putHtmlObject : Account -> Bucket -> Key -> String -> Request String
+putHtmlObject account bucket key html =
+    putPublicObject account bucket key <| htmlBody html
 
 
 {-| Delete an S3 object.

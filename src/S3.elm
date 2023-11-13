@@ -21,7 +21,7 @@ module S3 exposing
     , addQuery, addHeaders
     , readAccounts, decodeAccounts, accountDecoder, encodeAccount
     , objectPath, parserRequest, stringRequest, requestUrl
-    , makeService, presign
+    , makeService
     )
 
 {-| Pure Elm client for the [AWS Simple Storage Service](https://aws.amazon.com/s3/) (S3) or [Digital Ocean Spaces](https://developers.digitalocean.com/documentation/spaces/).
@@ -470,18 +470,18 @@ send bucket account request =
             )
 
 
-presign : Bucket -> Account -> Time.Posix -> Request a -> String
-presign bucket account timestamp request =
-    let
-        service =
-            makeService bucket account
 
-        credentials =
-            makeCredentials account
-    in
-    request
-        |> (fudgeRequest account bucket >> Tuple.second)
-        |> AWS.PreSign.toUrl service credentials timestamp
+-- presign : Bucket -> Account -> Time.Posix -> Request a -> String
+-- presign bucket account timestamp request =
+--     let
+--         service =
+--             makeService bucket account
+--         credentials =
+--             makeCredentials account
+--     in
+--     request
+--         |> (fudgeRequest account bucket >> Tuple.second)
+--         |> AWS.PreSign.toUrl service credentials timestamp
 
 
 formatQuery : Query -> List ( String, String )
